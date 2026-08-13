@@ -21,7 +21,9 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "app.h"
+#include "log.h"
+#include "rs485_if.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,7 +46,11 @@ UART_HandleTypeDef huart1;
 UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
+static uint8_t g_rx_rs485 = 0;
 
+volatile uint32_t g_rs485_rx_cnt   = 0;
+volatile uint32_t g_uart1_err_cnt  = 0;
+volatile uint32_t g_uart1_err_last = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -58,6 +64,32 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    g_rs485_rx_cnt++;
+    rs485_if_on_rx_isr(g_rx_rs485);
+    (void)HAL_UART_Receive_IT(&huart1, &g_rx_rs485, 1);
+  }
+}
+
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+  if (huart->Instance == USART1)
+  {
+    g_uart1_err_cnt++;
+    g_uart1_err_last = huart->ErrorCode;
+
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    __HAL_UART_CLEAR_PEFLAG(huart);
+
+    (void)HAL_UART_Receive_IT(&huart1, &g_rx_rs485, 1);
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -94,12 +126,19 @@ int main(void)
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
+  HAL_GPIO_WritePin(DE_485_GPIO_Port, DE_485_Pin, GPIO_PIN_RESET);
+  log_init(&huart2);
+  (void)HAL_UART_Receive_IT(&huart1, &g_rx_rs485, 1);
+  app_init();
+  log_printf("[BOOT] init done\r\n");
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    app_loop();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
