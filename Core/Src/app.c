@@ -57,6 +57,10 @@ static uint32_t s_start_ms = 0;
 
 static uint16_t s_last_seq = 0;   // 마지막 RUN의 seq(참고용)
 static uint16_t s_next_step = 0;  // DONE 시 NEXT (0=정상 다음 step)
+static uint8_t  s_last_run_valid = 0;
+static uint8_t  s_last_run_cancelled = 0;
+static char     s_last_run_k[64] = {0};
+static char     s_last_run_v[256] = {0};
 
 /* =========================
  * IO helpers
@@ -631,6 +635,43 @@ static int parse_in_cond_list(const char *v,
   return (*out_cnt > 0) ? 0 : -1;
 }
 
+/* RUN을 ACK하기 전에 K/V 전체를 부작용 없이 검증한다. */
+static const char *run_validate(const char *k, const char *v)
+{
+  uint8_t kaddr = 0;
+  uint8_t idx = 0;
+  k_kind_t kind = K_KIND_NONE;
+
+  if (parse_k(k, &kaddr, &kind, &idx) != 0) {
+    return "BAD_K";
+  }
+  if (s_addr != 0 && kaddr != s_addr) {
+    return "ADDR_MISMATCH";
+  }
+
+  if (kind == K_KIND_R) {
+    out_tok_t tok[RUN_OUT_SEQ_MAX];
+    uint8_t cnt = 0;
+    if (parse_out_seq(v, tok, &cnt) != 0) {
+      return "BAD_V";
+    }
+    return NULL;
+  }
+
+  if (kind == K_KIND_L) {
+    l_mode_t mode = LMODE_NO;
+    l_cond_t cond[RUN_L_COND_MAX];
+    uint8_t cnt = 0;
+    uint32_t stby_ms = 0;
+    if (parse_in_cond_list(v, &mode, cond, &cnt, &stby_ms) != 0) {
+      return "BAD_V";
+    }
+    return NULL;
+  }
+
+  return "UNSUPPORTED_KIND";
+}
+
 static void in_watch_start(uint8_t ch, const char *v)
 {
   memset(&s_in, 0, sizeof(s_in));
@@ -836,11 +877,20 @@ static const char* state_str(void)
 /* =========================
  * RS485 command handlers
  * ========================= */
+static void run_context_clear(void)
+{
+  memset(&s_out, 0, sizeof(s_out));
+  memset(&s_in, 0, sizeof(s_in));
+  s_state = SLV_IDLE;
+  s_start_ms = 0;
+  s_next_step = 0;
+}
+
 static void handle_all_off(uint8_t req_addr, uint16_t seq)
 {
   io_all_off();
-  s_state = SLV_IDLE;
-  s_next_step = 0;
+  run_context_clear();
+  if (s_last_run_valid) s_last_run_cancelled = 1;
 
   if (req_addr != 0) {
     (void)rs485_if_send(s_addr, seq, "ACK", "");
@@ -851,8 +901,8 @@ static void handle_all_off(uint8_t req_addr, uint16_t seq)
 static void handle_m_stop(uint8_t req_addr, uint16_t seq)
 {
   io_all_off();
-  s_state = SLV_IDLE;
-  s_next_step = 0;
+  run_context_clear();
+  if (s_last_run_valid) s_last_run_cancelled = 1;
 
   if (req_addr != 0) {
     (void)rs485_if_send(s_addr, seq, "ACK", "");
@@ -874,9 +924,28 @@ static void handle_run(uint8_t req_addr, uint16_t seq, const char *args)
     return;
   }
 
-  /* BUSY 중 새 RUN이 들어오면 기존 동작을 재시작하지 않음
-   * - 수신기 ACK 재시도/중복 송신으로 릴레이 타이머가 리셋되는 문제 방지
-   */
+  /* 동일 transaction 재전송은 기존 실행을 다시 시작하지 않는다. */
+  if (s_last_run_valid && seq == s_last_seq) {
+    if (strcmp(k, s_last_run_k) != 0 || strcmp(v, s_last_run_v) != 0) {
+      log_printf("[RUN] seq conflict seq=%u K=%s V=%s\r\n",
+                 (unsigned)seq, k, v);
+      (void)rs485_if_send(s_addr, seq, "NACK", "SEQ_CONFLICT");
+      return;
+    }
+
+    if (s_last_run_cancelled) {
+      log_printf("[RUN] cancelled retry blocked seq=%u\r\n", (unsigned)seq);
+      (void)rs485_if_send(s_addr, seq, "NACK", "CANCELLED");
+      return;
+    }
+
+    log_printf("[RUN] duplicate ACK seq=%u state=%s\r\n",
+               (unsigned)seq, state_str());
+    (void)rs485_if_send(s_addr, seq, "ACK", "");
+    return;
+  }
+
+  /* BUSY 중 다른 transaction은 기존 실행을 유지하고 거부한다. */
   if (s_state == SLV_BUSY) {
     log_printf("[RUN] BUSY ignore seq=%u K=%s V=%s\r\n",
                (unsigned)seq, k, v);
@@ -884,7 +953,25 @@ static void handle_run(uint8_t req_addr, uint16_t seq, const char *args)
     return;
   }
 
-  /* RUN 시작 요청은 형식 확인 후 ACK */
+  /* 새 RUN은 K 주소/종류와 R/L의 V 전체를 검증한 뒤에만 ACK한다. */
+  const char *nack_reason = run_validate(k, v);
+  if (nack_reason != NULL) {
+    log_printf("[RUN] validate FAIL seq=%u reason=%s K=%s V=%s\r\n",
+               (unsigned)seq, nack_reason, k, v);
+    (void)rs485_if_send(s_addr, seq, "NACK", nack_reason);
+    return;
+  }
+
+  /* 이전 R/L 실행기의 잔여 상태를 제거하고 새 transaction을 기록한다. */
+  run_context_clear();
+  s_last_seq = seq;
+  strncpy(s_last_run_k, k, sizeof(s_last_run_k)-1);
+  s_last_run_k[sizeof(s_last_run_k)-1] = 0;
+  strncpy(s_last_run_v, v, sizeof(s_last_run_v)-1);
+  s_last_run_v[sizeof(s_last_run_v)-1] = 0;
+  s_last_run_valid = 1;
+  s_last_run_cancelled = 0;
+
   (void)rs485_if_send(s_addr, seq, "ACK", "");
 
   run_start(seq, k, v);
@@ -939,6 +1026,10 @@ void app_init(void)
   s_start_ms = 0;
   s_last_seq = 0;
   s_next_step = 0;
+  s_last_run_valid = 0;
+  s_last_run_cancelled = 0;
+  s_last_run_k[0] = 0;
+  s_last_run_v[0] = 0;
 
   log_printf("[SLAVE] OUT_ACTIVE_HIGH=%u (ON=%s)\r\n",
              (unsigned)OUT_ACTIVE_HIGH,
