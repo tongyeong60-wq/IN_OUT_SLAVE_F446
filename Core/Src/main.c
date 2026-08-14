@@ -47,10 +47,6 @@ UART_HandleTypeDef huart2;
 
 /* USER CODE BEGIN PV */
 static uint8_t g_rx_rs485 = 0;
-
-volatile uint32_t g_rs485_rx_cnt   = 0;
-volatile uint32_t g_uart1_err_cnt  = 0;
-volatile uint32_t g_uart1_err_last = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -65,13 +61,23 @@ static void MX_USART2_UART_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+static void USART1_RearmRxFromIsr(void)
+{
+  if (huart1.RxState == HAL_UART_STATE_BUSY_RX) {
+    return;
+  }
+  if ((huart1.RxState != HAL_UART_STATE_READY) ||
+      (HAL_UART_Receive_IT(&huart1, &g_rx_rs485, 1) != HAL_OK)) {
+    rs485_if_on_rx_rearm_fail_isr();
+  }
+}
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1)
   {
-    g_rs485_rx_cnt++;
     rs485_if_on_rx_isr(g_rx_rs485);
-    (void)HAL_UART_Receive_IT(&huart1, &g_rx_rs485, 1);
+    USART1_RearmRxFromIsr();
   }
 }
 
@@ -79,15 +85,14 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
 {
   if (huart->Instance == USART1)
   {
-    g_uart1_err_cnt++;
-    g_uart1_err_last = huart->ErrorCode;
+    rs485_if_on_uart_error_isr(huart->ErrorCode);
 
     __HAL_UART_CLEAR_OREFLAG(huart);
     __HAL_UART_CLEAR_NEFLAG(huart);
     __HAL_UART_CLEAR_FEFLAG(huart);
     __HAL_UART_CLEAR_PEFLAG(huart);
 
-    (void)HAL_UART_Receive_IT(&huart1, &g_rx_rs485, 1);
+    USART1_RearmRxFromIsr();
   }
 }
 

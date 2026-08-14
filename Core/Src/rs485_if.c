@@ -21,6 +21,16 @@ static uint16_t s_de_pin = 0;
 
 static uint8_t s_rb_mem[512];
 static ringbuf_t s_rb;
+static volatile uint32_t s_uart_ore_count = 0;
+static volatile uint32_t s_uart_fe_count = 0;
+static volatile uint32_t s_uart_ne_count = 0;
+static volatile uint32_t s_uart_pe_count = 0;
+static volatile uint32_t s_uart_rx_rearm_fail_count = 0;
+static volatile uint32_t s_uart_last_error = 0;
+static volatile uint32_t s_tx_fail_count = 0;
+static volatile uint32_t s_tx_tc_timeout_count = 0;
+static volatile uint8_t s_uart_error_pending = 0;
+static volatile uint8_t s_tx_error_pending = 0;
 
 static void delay_us(uint32_t us)
 {
@@ -40,6 +50,58 @@ void rs485_if_init(UART_HandleTypeDef *huart, GPIO_TypeDef *de_port, uint16_t de
 void rs485_if_on_rx_isr(uint8_t b)
 {
     (void)ringbuf_push_isr(&s_rb, b);
+}
+
+void rs485_if_on_uart_error_isr(uint32_t error_code)
+{
+    s_uart_last_error = error_code;
+    if (error_code & HAL_UART_ERROR_ORE) s_uart_ore_count++;
+    if (error_code & HAL_UART_ERROR_FE)  s_uart_fe_count++;
+    if (error_code & HAL_UART_ERROR_NE)  s_uart_ne_count++;
+    if (error_code & HAL_UART_ERROR_PE)  s_uart_pe_count++;
+    s_uart_error_pending = 1;
+    ringbuf_abort_frame_isr(&s_rb);
+}
+
+void rs485_if_on_rx_rearm_fail_isr(void)
+{
+    s_uart_rx_rearm_fail_count++;
+    s_uart_error_pending = 1;
+}
+
+void rs485_if_get_diag(rs485_diag_t *diag, bool clear_pending)
+{
+    ringbuf_diag_t rb_diag;
+    if (!diag) return;
+    uint32_t primask = __get_PRIMASK();
+    __disable_irq();
+    ringbuf_get_diag(&s_rb, &rb_diag, clear_pending);
+    diag->rx_overrun_count = rb_diag.overrun_count;
+    diag->rx_oversize_count = rb_diag.oversize_count;
+    diag->rx_overrun_pending = rb_diag.overrun_pending;
+    diag->rx_oversize_pending = rb_diag.oversize_pending;
+    diag->uart_ore_count = s_uart_ore_count;
+    diag->uart_fe_count = s_uart_fe_count;
+    diag->uart_ne_count = s_uart_ne_count;
+    diag->uart_pe_count = s_uart_pe_count;
+    diag->uart_rx_rearm_fail_count = s_uart_rx_rearm_fail_count;
+    diag->uart_last_error = s_uart_last_error;
+    diag->tx_fail_count = s_tx_fail_count;
+    diag->tx_tc_timeout_count = s_tx_tc_timeout_count;
+    diag->uart_error_pending = s_uart_error_pending;
+    diag->tx_error_pending = s_tx_error_pending;
+    if (clear_pending) {
+        uint32_t uart_total = diag->uart_ore_count + diag->uart_fe_count +
+                              diag->uart_ne_count + diag->uart_pe_count +
+                              diag->uart_rx_rearm_fail_count;
+        uint32_t uart_now = s_uart_ore_count + s_uart_fe_count + s_uart_ne_count +
+                            s_uart_pe_count + s_uart_rx_rearm_fail_count;
+        uint32_t tx_total = diag->tx_fail_count + diag->tx_tc_timeout_count;
+        uint32_t tx_now = s_tx_fail_count + s_tx_tc_timeout_count;
+        if (uart_now == uart_total) s_uart_error_pending = 0;
+        if (tx_now == tx_total) s_tx_error_pending = 0;
+    }
+    if (primask == 0u) __enable_irq();
 }
 
 static int hex4_to_u16(const char *p, uint16_t *out)
@@ -158,6 +220,13 @@ bool rs485_if_send(uint8_t addr, uint16_t seq, const char *cmd, const char *args
 
     HAL_StatusTypeDef st = HAL_UART_Transmit(s_uart, (uint8_t*)frame, (uint16_t)strlen(frame), 200);
 
+    if (st != HAL_OK) {
+        s_tx_fail_count++;
+        s_tx_error_pending = 1;
+        HAL_GPIO_WritePin(s_de_port, s_de_pin, GPIO_PIN_RESET);
+        return false;
+    }
+
     const uint32_t tc_timeout_ms = 10u;
     const uint32_t tc_start_ms = HAL_GetTick();
     bool tc_complete = false;
@@ -165,9 +234,13 @@ bool rs485_if_send(uint8_t addr, uint16_t seq, const char *cmd, const char *args
         if ((HAL_GetTick() - tc_start_ms) >= tc_timeout_ms) break;
     }
     if (__HAL_UART_GET_FLAG(s_uart, UART_FLAG_TC) != RESET) tc_complete = true;
+    if (!tc_complete) {
+        s_tx_tc_timeout_count++;
+        s_tx_error_pending = 1;
+    }
 
     HAL_GPIO_WritePin(s_de_port, s_de_pin, GPIO_PIN_RESET);
 
     log_printf("[RS485] TX %s", frame);
-    return (st == HAL_OK) && tc_complete;
+    return tc_complete;
 }

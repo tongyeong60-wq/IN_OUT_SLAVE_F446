@@ -25,6 +25,8 @@ extern UART_HandleTypeDef huart1;
 #define STATUS_PERSIST_DONE      1   // DONE 상태 유지(다음 RUN 전까지)
 
 #define MS_PER_SEC           1000u
+#define INPUT_DEBOUNCE_MS    5u
+#define APP_FRAME_BUDGET     2u
 
 /* =========================
  * Output polarity (relay/mosfet compatibility)
@@ -87,35 +89,16 @@ static void out_set(uint8_t ch /*1..5*/, uint8_t on)
   }
 }
 
-static uint8_t out_get_mask(void)
-{
-  // 핀 상태 기반. 보드에 따라 읽기가 불안정하면 SW 상태변수로 관리 권장.
-  uint8_t m = 0;
+typedef struct {
+  uint8_t last_raw;
+  uint32_t raw_changed_ms;
+  uint8_t stable_logical;
+  uint8_t initialized;
+} input_db_t;
 
-  GPIO_PinState p1 = HAL_GPIO_ReadPin(OUT1_GPIO_Port, OUT1_Pin);
-  GPIO_PinState p2 = HAL_GPIO_ReadPin(OUT2_GPIO_Port, OUT2_Pin);
-  GPIO_PinState p3 = HAL_GPIO_ReadPin(OUT3_GPIO_Port, OUT3_Pin);
-  GPIO_PinState p4 = HAL_GPIO_ReadPin(OUT4_GPIO_Port, OUT4_Pin);
-  GPIO_PinState p5 = HAL_GPIO_ReadPin(OUT5_GPIO_Port, OUT5_Pin);
+static input_db_t s_input_db[5];
 
-#if OUT_ACTIVE_HIGH
-  if (p1 == GPIO_PIN_SET) m |= (1u<<0);
-  if (p2 == GPIO_PIN_SET) m |= (1u<<1);
-  if (p3 == GPIO_PIN_SET) m |= (1u<<2);
-  if (p4 == GPIO_PIN_SET) m |= (1u<<3);
-  if (p5 == GPIO_PIN_SET) m |= (1u<<4);
-#else
-  if (p1 == GPIO_PIN_RESET) m |= (1u<<0);
-  if (p2 == GPIO_PIN_RESET) m |= (1u<<1);
-  if (p3 == GPIO_PIN_RESET) m |= (1u<<2);
-  if (p4 == GPIO_PIN_RESET) m |= (1u<<3);
-  if (p5 == GPIO_PIN_RESET) m |= (1u<<4);
-#endif
-
-  return m;
-}
-
-static uint8_t in_read(uint8_t ch /*1..5*/)
+static uint8_t in_read_raw_logical(uint8_t ch /*1..5*/)
 {
   GPIO_PinState st = GPIO_PIN_RESET;
   switch (ch) {
@@ -129,15 +112,47 @@ static uint8_t in_read(uint8_t ch /*1..5*/)
   return (st == GPIO_PIN_RESET) ? 1u : 0u;
 }
 
-static uint8_t in_get_mask(void)
+static void input_debounce_init(void)
 {
-  uint8_t m = 0;
-  if (in_read(1)) m |= (1u<<0);
-  if (in_read(2)) m |= (1u<<1);
-  if (in_read(3)) m |= (1u<<2);
-  if (in_read(4)) m |= (1u<<3);
-  if (in_read(5)) m |= (1u<<4);
-  return m;
+  uint32_t now = HAL_GetTick();
+  for (uint8_t i = 0; i < 5u; i++) {
+    s_input_db[i].last_raw = in_read_raw_logical((uint8_t)(i + 1u));
+    s_input_db[i].raw_changed_ms = now;
+    s_input_db[i].stable_logical = 0u;
+    s_input_db[i].initialized = 0u;
+  }
+}
+
+static void input_debounce_tick(void)
+{
+  uint32_t now = HAL_GetTick();
+  for (uint8_t i = 0; i < 5u; i++) {
+    input_db_t *db = &s_input_db[i];
+    uint8_t raw = in_read_raw_logical((uint8_t)(i + 1u));
+    if (raw != db->last_raw) {
+      db->last_raw = raw;
+      db->raw_changed_ms = now;
+      continue;
+    }
+    if ((uint32_t)(now - db->raw_changed_ms) >= INPUT_DEBOUNCE_MS) {
+      if (!db->initialized) {
+        db->stable_logical = raw;
+        db->initialized = 1u;
+      } else if (db->stable_logical != raw) {
+        db->stable_logical = raw;
+      }
+    }
+  }
+}
+
+static uint8_t in_ready(uint8_t ch)
+{
+  return (ch >= 1u && ch <= 5u) ? s_input_db[ch - 1u].initialized : 0u;
+}
+
+static uint8_t in_read(uint8_t ch /*1..5*/)
+{
+  return in_ready(ch) ? s_input_db[ch - 1u].stable_logical : 0u;
 }
 
 /* =========================
@@ -479,12 +494,14 @@ static struct {
   uint32_t  standby_ms;       // 감시 시작 전 대기시간
   uint8_t   standby_done;     // 0=STBY 중, 1=감시 중
 
-  uint8_t   prev_in;          // raw input
+  uint8_t   prev_in;          // debounced logical input
   uint8_t   ev_prev;          // 이전 이벤트 상태
   uint8_t   ev_now;           // 현재 이벤트 상태
 
   uint8_t   stable_active;    // 이벤트 연속 유지 계측 중
   uint32_t  stable_start_ms;  // 이벤트 상태 진입 시각
+  uint8_t   input_ready_seen; // 최초 debounce 확정은 이벤트가 아닌 기준 상태
+  uint8_t   initial_active_suppressed;
 
   uint8_t   running;
 } s_in = {0};
@@ -699,6 +716,7 @@ static void in_watch_start(uint8_t ch, const char *v)
   s_in.ev_now = s_in.ev_prev;
   s_in.stable_active = 0;
   s_in.stable_start_ms = 0;
+  s_in.input_ready_seen = in_ready(ch);
 
   s_in.standby_done = (stby_ms == 0u) ? 1u : 0u;
   if (s_in.standby_done) {
@@ -719,6 +737,18 @@ static void in_watch_tick(void)
   if (!s_in.running) return;
 
   uint32_t now = HAL_GetTick();
+
+  if (!in_ready(s_in.ch)) return;
+  if (!s_in.input_ready_seen) {
+    s_in.prev_in = in_read(s_in.ch);
+    s_in.ev_prev = is_event_state(s_in.mode, s_in.prev_in);
+    s_in.ev_now = s_in.ev_prev;
+    s_in.stable_active = 0;
+    s_in.stable_start_ms = 0;
+    s_in.input_ready_seen = 1u;
+    s_in.initial_active_suppressed = s_in.ev_prev;
+    return;
+  }
 
   // 1) STBY 처리
   if (!s_in.standby_done) {
@@ -742,6 +772,13 @@ static void in_watch_tick(void)
   // 2) 현재 이벤트 상태 계산
   uint8_t cur = in_read(s_in.ch);
   s_in.ev_now = is_event_state(s_in.mode, cur);
+
+  if (s_in.initial_active_suppressed) {
+    s_in.ev_prev = s_in.ev_now;
+    s_in.prev_in = cur;
+    if (s_in.ev_now) return;
+    s_in.initial_active_suppressed = 0u;
+  }
 
   // 이벤트 상태 진입: NO면 OFF->ON, NC면 ON->OFF
   if (!s_in.ev_prev && s_in.ev_now) {
@@ -1020,6 +1057,7 @@ void app_init(void)
   }
 
   rs485_if_init(&huart1, DE_485_GPIO_Port, DE_485_Pin);
+  input_debounce_init();
 
   io_all_off();
   s_state = SLV_IDLE;
@@ -1046,16 +1084,38 @@ void app_init(void)
 
 void app_loop(void)
 {
+  input_debounce_tick();
   run_tick();
 
-  /* 세그먼트 표시 복구용: loop마다 현재 주소 재출력 */
-  seg595_show_u8(s_addr);
+  rs485_diag_t diag;
+  rs485_if_get_diag(&diag, true);
+  if (diag.rx_overrun_pending || diag.rx_oversize_pending) {
+    log_printf("[RS485_RX] overrun=%lu oversize=%lu\r\n",
+               (unsigned long)diag.rx_overrun_count,
+               (unsigned long)diag.rx_oversize_count);
+  }
+  if (diag.uart_error_pending) {
+    log_printf("[UART1] err=0x%08lX ORE=%lu FE=%lu NE=%lu PE=%lu rearm_fail=%lu\r\n",
+               (unsigned long)diag.uart_last_error,
+               (unsigned long)diag.uart_ore_count,
+               (unsigned long)diag.uart_fe_count,
+               (unsigned long)diag.uart_ne_count,
+               (unsigned long)diag.uart_pe_count,
+               (unsigned long)diag.uart_rx_rearm_fail_count);
+  }
+  if (diag.tx_error_pending) {
+    log_printf("[RS485_TX] fail=%lu tc_timeout=%lu\r\n",
+               (unsigned long)diag.tx_fail_count,
+               (unsigned long)diag.tx_tc_timeout_count);
+  }
 
   rs485_req_t req;
   rs485_parse_result_t res;
 
-  while (rs485_if_poll(&req, &res))
+  uint8_t frame_count = 0;
+  while (frame_count < APP_FRAME_BUDGET && rs485_if_poll(&req, &res))
   {
+    frame_count++;
     if (res == RS485_MSG_BADCRC) {
       log_printf("[RS485_RX] BADCRC\r\n");
       continue;
@@ -1110,19 +1170,6 @@ void app_loop(void)
 
     if (strcmp(req.cmd, "STATUS") == 0) {
       handle_status(req.addr, req.seq);
-      continue;
-    }
-
-    /* CFG_SAVE / PT_SAVE: 현 단계는 ACK만 */
-    if (strcmp(req.cmd, "CFG_SAVE") == 0) {
-      if (req.addr != 0) (void)rs485_if_send(s_addr, req.seq, "ACK", "");
-      log_printf("[CFG] received (stub)\r\n");
-      continue;
-    }
-
-    if (strcmp(req.cmd, "PT_SAVE") == 0) {
-      if (req.addr != 0) (void)rs485_if_send(s_addr, req.seq, "ACK", "");
-      log_printf("[PT] received (stub)\r\n");
       continue;
     }
 

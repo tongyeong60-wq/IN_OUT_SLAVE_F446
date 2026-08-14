@@ -27,8 +27,28 @@ typedef struct {
     char     args[128]; // "K=...;V=..." 등
 } rs485_req_t;
 
+typedef struct {
+    uint32_t rx_overrun_count;
+    uint32_t rx_oversize_count;
+    uint32_t uart_ore_count;
+    uint32_t uart_fe_count;
+    uint32_t uart_ne_count;
+    uint32_t uart_pe_count;
+    uint32_t uart_rx_rearm_fail_count;
+    uint32_t tx_fail_count;
+    uint32_t tx_tc_timeout_count;
+    uint32_t uart_last_error;
+    uint8_t rx_overrun_pending;
+    uint8_t rx_oversize_pending;
+    uint8_t uart_error_pending;
+    uint8_t tx_error_pending;
+} rs485_diag_t;
+
 void rs485_if_init(UART_HandleTypeDef *huart, GPIO_TypeDef *de_port, uint16_t de_pin);
 void rs485_if_on_rx_isr(uint8_t b);
+void rs485_if_on_uart_error_isr(uint32_t error_code);
+void rs485_if_on_rx_rearm_fail_isr(void);
+void rs485_if_get_diag(rs485_diag_t *diag, bool clear_pending);
 
 // 한 줄(@... \n) 단위로 읽어서 파싱. true면 out에 유효 데이터(OK/에러 포함)
 bool rs485_if_poll(rs485_req_t *out, rs485_parse_result_t *res);
