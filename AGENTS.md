@@ -159,8 +159,10 @@
 - `DE_485 LOW`: DE=0, `/RE`=0, Driver OFF, Receiver ON, RX mode
 - `DE_485 HIGH`: DE=1, `/RE`=1, Driver ON, Receiver OFF, TX mode
 - 정상 idle 및 초기 상태는 LOW/RX이다.
+- PA8 `DE_485`는 Initial LOW, Output Push-Pull, MCU Internal Pull-up, Low Speed로 설정한다.
+- 외부 10kΩ pull-up과 MCU Internal Pull-up의 병행을 허용한다.
 - 송신 직전에만 `DE_485`를 HIGH로 전환한다.
-- UART 송신 후 Transmission Complete(TC)를 확인한 다음 `DE_485`를 LOW로 복귀시킨다.
+- UART 송신 후 Transmission Complete(TC)를 확인한 다음 `DE_485`를 즉시 LOW/RX로 복귀시킨다.
 - `DE_485`를 기본 HIGH로 초기화하지 않는다.
 
 ### IO 프로젝트 RS485 기준

@@ -158,11 +158,16 @@ bool rs485_if_send(uint8_t addr, uint16_t seq, const char *cmd, const char *args
 
     HAL_StatusTypeDef st = HAL_UART_Transmit(s_uart, (uint8_t*)frame, (uint16_t)strlen(frame), 200);
 
-    while (__HAL_UART_GET_FLAG(s_uart, UART_FLAG_TC) == RESET) { }
+    const uint32_t tc_timeout_ms = 10u;
+    const uint32_t tc_start_ms = HAL_GetTick();
+    bool tc_complete = false;
+    while (__HAL_UART_GET_FLAG(s_uart, UART_FLAG_TC) == RESET) {
+        if ((HAL_GetTick() - tc_start_ms) >= tc_timeout_ms) break;
+    }
+    if (__HAL_UART_GET_FLAG(s_uart, UART_FLAG_TC) != RESET) tc_complete = true;
 
-    delay_us(50);
     HAL_GPIO_WritePin(s_de_port, s_de_pin, GPIO_PIN_RESET);
 
     log_printf("[RS485] TX %s", frame);
-    return (st == HAL_OK);
+    return (st == HAL_OK) && tc_complete;
 }

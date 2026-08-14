@@ -128,8 +128,8 @@ int main(void)
 
   HAL_GPIO_WritePin(DE_485_GPIO_Port, DE_485_Pin, GPIO_PIN_RESET);
   log_init(&huart2);
-  (void)HAL_UART_Receive_IT(&huart1, &g_rx_rs485, 1);
   app_init();
+  (void)HAL_UART_Receive_IT(&huart1, &g_rx_rs485, 1);
   log_printf("[BOOT] init done\r\n");
 
   /* USER CODE END 2 */
@@ -305,7 +305,7 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin : DE_485_Pin */
   GPIO_InitStruct.Pin = DE_485_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(DE_485_GPIO_Port, &GPIO_InitStruct);
 
